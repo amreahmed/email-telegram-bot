@@ -6,7 +6,10 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
+    "dev": "nodemon src/server.js",
+    "test:simulate500": "node scripts/simulate500Otp.js --count=500 --matchingRatio=0.7 --lang=ar",
+    "test:simulate500:en": "node scripts/simulate500Otp.js --count=500 --matchingRatio=0.7 --lang=en",
+    "test:simulate1000accounts": "node scripts/simulate1000Accounts.js --accounts=1000 --messagesPerAccount=15 --matchingRatio=0.7 --concurrency=10 --lang=ar"
   },
   "keywords": [
     "telegram",

@@ -8,6 +8,7 @@ const { safeSendMessage } = require("./telegramService");
 const { extractCode } = require("./codeExtractionService");
 const { buildOtpNotification } = require("./notificationTemplates");
 const { matchProvider } = require("./providerEngine");
+const { getAccessibleTelegramIds, resolveSharedScope } = require("./sharedAccessService");
 const { asyncPool } = require("../utils/asyncPool");
 const logger = require("../utils/logger").withContext("PollingService");
 const { runtimeConfig } = require("../config/runtime");
@@ -153,7 +154,10 @@ async function processAccount(account, options = {}) {
               accountEmail: account.email,
             });
 
-            await safeSendMessage(telegramUser.telegramId, notificationMessage);
+            const recipientTelegramIds = getAccessibleTelegramIds(telegramUser.telegramId);
+            for (const recipientId of recipientTelegramIds) {
+              await safeSendMessage(recipientId, notificationMessage);
+            }
 
             try {
               await MailLog.create({
@@ -253,8 +257,10 @@ async function checkForUserWithOptions(telegramId, options = {}) {
     return { accounts: 0, checked: 0, notified: 0, matched: 0, duplicateSkipped: 0, nonMatchingSkipped: 0 };
   }
 
+  const scope = await resolveSharedScope(user.telegramId, user._id);
+
   const accounts = await OutlookAccount.find({
-    telegramUserId: user._id,
+    telegramUserId: { $in: scope.userIds },
     isActive: true,
   });
 

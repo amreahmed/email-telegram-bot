@@ -2,6 +2,7 @@ const TelegramUser = require("../models/TelegramUser");
 const OutlookAccount = require("../models/OutlookAccount");
 const { createAuthUrlForTelegramUser } = require("../services/oauthService");
 const { checkForUser, checkForUserWithOptions } = require("../services/pollingService");
+const { resolveSharedScope } = require("../services/sharedAccessService");
 const logger = require("../utils/logger");
 
 const ACCOUNTS_PAGE_SIZE = 50;
@@ -202,7 +203,8 @@ async function handleConnect(ctx) {
 
 async function handleAccounts(ctx) {
   const user = await getOrCreateTelegramUser(ctx);
-  const accounts = await OutlookAccount.find({ telegramUserId: user._id }).sort({ connectedAt: -1 });
+  const scope = await resolveSharedScope(user.telegramId, user._id);
+  const accounts = await OutlookAccount.find({ telegramUserId: { $in: scope.userIds } }).sort({ connectedAt: -1 });
 
   if (accounts.length === 0) {
     return ctx.reply(textFor(user, "noAccounts"));
@@ -277,7 +279,8 @@ async function renderAccountsPage(ctx, user, accounts, pageNumber, editMessage) 
 
 async function handleAccountsPageAction(ctx) {
   const user = await getOrCreateTelegramUser(ctx);
-  const accounts = await OutlookAccount.find({ telegramUserId: user._id }).sort({ connectedAt: -1 });
+  const scope = await resolveSharedScope(user.telegramId, user._id);
+  const accounts = await OutlookAccount.find({ telegramUserId: { $in: scope.userIds } }).sort({ connectedAt: -1 });
   const requestedPage = Number(ctx.match?.[1] || 1);
 
   await ctx.answerCbQuery();
@@ -346,7 +349,10 @@ async function handleHelp(ctx) {
 
 async function handleUnlinkHelp(ctx) {
   const user = await getOrCreateTelegramUser(ctx);
-  const accounts = await OutlookAccount.find({ telegramUserId: user._id, isActive: true }).sort({ connectedAt: -1 });
+  const scope = await resolveSharedScope(user.telegramId, user._id);
+  const accounts = await OutlookAccount.find({ telegramUserId: { $in: scope.userIds }, isActive: true }).sort({
+    connectedAt: -1,
+  });
 
   if (accounts.length === 0) {
     return ctx.reply(textFor(user, "unlinkNoAccounts"));
@@ -365,7 +371,10 @@ async function handleUnlink(ctx) {
     return handleUnlinkHelp(ctx);
   }
 
-  const accounts = await OutlookAccount.find({ telegramUserId: user._id, isActive: true }).sort({ connectedAt: -1 });
+  const scope = await resolveSharedScope(user.telegramId, user._id);
+  const accounts = await OutlookAccount.find({ telegramUserId: { $in: scope.userIds }, isActive: true }).sort({
+    connectedAt: -1,
+  });
   if (accounts.length === 0) {
     return ctx.reply(textFor(user, "unlinkNoAccounts"));
   }
