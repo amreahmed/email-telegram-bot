@@ -8,7 +8,7 @@ const { safeSendMessage } = require("./telegramService");
 const { extractCode } = require("./codeExtractionService");
 const { buildOtpNotification } = require("./notificationTemplates");
 const { matchProvider } = require("./providerEngine");
-const { getAccessibleTelegramIds, resolveSharedScope } = require("./sharedAccessService");
+const { getNotificationChatIds, resolveSharedScope } = require("./sharedAccessService");
 const { asyncPool } = require("../utils/asyncPool");
 const logger = require("../utils/logger").withContext("PollingService");
 const { runtimeConfig } = require("../config/runtime");
@@ -46,6 +46,8 @@ async function processAccount(account, options = {}) {
   if (!telegramUser) {
     return { checked: 0, notified: 0, matched: 0, duplicateSkipped: 0, nonMatchingSkipped: 0 };
   }
+
+  const recipientChatIds = await getNotificationChatIds(telegramUser.telegramId);
 
   try {
     logger.info("Processing account", {
@@ -154,8 +156,7 @@ async function processAccount(account, options = {}) {
               accountEmail: account.email,
             });
 
-            const recipientTelegramIds = getAccessibleTelegramIds(telegramUser.telegramId);
-            for (const recipientId of recipientTelegramIds) {
+            for (const recipientId of recipientChatIds) {
               await safeSendMessage(recipientId, notificationMessage);
             }
 

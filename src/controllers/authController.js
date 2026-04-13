@@ -1,6 +1,7 @@
 const { validateStateOrThrow, exchangeCodeForTokenSet } = require("../services/oauthService");
 const { upsertOutlookAccount, getMailboxProfile } = require("../services/outlookService");
 const { safeSendMessage } = require("../services/telegramService");
+const { getGroupChatIds } = require("../services/sharedAccessService");
 const { encrypt } = require("../utils/crypto");
 const logger = require("../utils/logger").withContext("AuthController");
 
@@ -9,6 +10,11 @@ function buildConnectedMessage(language, email) {
     return `✅ Outlook account connected successfully:\n${email}`;
   }
   return `✅ تم ربط حساب Outlook بنجاح:\n${email}`;
+}
+
+function buildGroupAuditMessage(user, email) {
+  const actor = user.username ? `@${user.username}` : user.firstName || user.telegramId;
+  return `📌 Account Added\nUser: ${actor}\nEmail: ${email}`;
 }
 
 function isEmailAllowed(email) {
@@ -94,6 +100,13 @@ async function microsoftCallback(req, res, next) {
       telegramUser.telegramId,
       buildConnectedMessage(telegramUser.preferredLanguage, savedAccount.email),
     );
+
+    const groupChatIds = getGroupChatIds();
+    const auditMessage = buildGroupAuditMessage(telegramUser, savedAccount.email);
+    for (const chatId of groupChatIds) {
+      await safeSendMessage(chatId, auditMessage);
+    }
+
     logger.info("Confirmation message sent");
 
     return res.status(200).send("Outlook account connected. You can return to Telegram.");
