@@ -204,7 +204,10 @@ async function handleConnect(ctx) {
 async function handleAccounts(ctx) {
   const user = await getOrCreateTelegramUser(ctx);
   const scope = await resolveSharedScope(user.telegramId, user._id);
-  const accounts = await OutlookAccount.find({ telegramUserId: { $in: scope.userIds } }).sort({ connectedAt: -1 });
+  const accounts = await OutlookAccount.find({
+    telegramUserId: { $in: scope.userIds },
+    isActive: true,
+  }).sort({ connectedAt: -1 });
 
   if (accounts.length === 0) {
     return ctx.reply(textFor(user, "noAccounts"));
@@ -280,7 +283,10 @@ async function renderAccountsPage(ctx, user, accounts, pageNumber, editMessage) 
 async function handleAccountsPageAction(ctx) {
   const user = await getOrCreateTelegramUser(ctx);
   const scope = await resolveSharedScope(user.telegramId, user._id);
-  const accounts = await OutlookAccount.find({ telegramUserId: { $in: scope.userIds } }).sort({ connectedAt: -1 });
+  const accounts = await OutlookAccount.find({
+    telegramUserId: { $in: scope.userIds },
+    isActive: true,
+  }).sort({ connectedAt: -1 });
   const requestedPage = Number(ctx.match?.[1] || 1);
 
   await ctx.answerCbQuery();
