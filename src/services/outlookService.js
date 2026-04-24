@@ -6,6 +6,21 @@ const { runtimeConfig } = require("../config/runtime");
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+const MAIL_FOLDER_ALIASES = {
+  inbox: ["inbox", "mailinbox", "البريدالوارد"],
+  junkemail: [
+    "junkemail",
+    "junkmail",
+    "junk",
+    "spam",
+    "junk e-mail",
+    "junk email",
+    "بريدمزعج",
+    "رسائلغيرمرغوبفيها",
+    "البريدغيرالهام",
+    "بريدغيرهام",
+  ],
+};
 
 function getTenantId() {
   return process.env.MS_TENANT_ID || "common";
@@ -53,6 +68,100 @@ function buildRetryDelay(attempt, retryAfterMs) {
   const base = 500 * 2 ** attempt;
   const jitter = Math.floor(Math.random() * 250);
   return Math.min(base + jitter, 30000);
+}
+
+function normalizeFolderLookupValue(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+}
+
+function getCanonicalFolderName(folderName) {
+  const normalized = normalizeFolderLookupValue(folderName);
+  if (!normalized) {
+    return "inbox";
+  }
+
+  for (const [canonicalName, aliases] of Object.entries(MAIL_FOLDER_ALIASES)) {
+    const normalizedAliases = aliases.map((alias) => normalizeFolderLookupValue(alias));
+    if (normalized === canonicalName || normalizedAliases.includes(normalized)) {
+      return canonicalName;
+    }
+  }
+
+  return normalized;
+}
+
+function shouldFallbackToClientSideSenderFilter(error) {
+  const message = String(error?.message || "");
+  return (
+    /InefficientFilter/i.test(message) ||
+    /ErrorInvalidUrlQueryFilter/i.test(message) ||
+    /restriction or sort order is too complex/i.test(message) ||
+    /unsupported.*filter/i.test(message) ||
+    /cannot be completed because the restriction/i.test(message)
+  );
+}
+
+async function listRootMailFolders(account) {
+  const query = new URLSearchParams({
+    $select: "id,displayName,isHidden,totalItemCount,unreadItemCount",
+    $top: "100",
+  });
+
+  const folders = [];
+  let url = `/me/mailFolders?includeHiddenFolders=true&${query.toString()}`;
+
+  while (url) {
+    const data = await graphRequest(account, url);
+    if (Array.isArray(data.value)) {
+      folders.push(...data.value);
+    }
+    url = data["@odata.nextLink"] ? data["@odata.nextLink"].replace(/^.*\/me/, "") : null;
+  }
+
+  return folders;
+}
+
+async function resolveMailFolder(account, folderName) {
+  const canonicalName = getCanonicalFolderName(folderName);
+  const encodedFolderName = encodeURIComponent(canonicalName);
+
+  try {
+    const folder = await graphRequest(
+      account,
+      `/me/mailFolders/${encodedFolderName}?$select=id,displayName,isHidden,totalItemCount,unreadItemCount`,
+    );
+    if (folder?.id) {
+      return {
+        id: folder.id,
+        name: folder.displayName || canonicalName,
+        source: "well-known",
+      };
+    }
+  } catch (error) {
+    logger.warn("Failed resolving mail folder by well-known name", {
+      accountId: String(account._id),
+      requestedFolder: folderName,
+      canonicalFolder: canonicalName,
+      error: error.message,
+    });
+  }
+
+  const aliases = new Set([canonicalName, ...(MAIL_FOLDER_ALIASES[canonicalName] || [])].map(normalizeFolderLookupValue));
+  const folders = await listRootMailFolders(account);
+  const match = folders.find((folder) => aliases.has(normalizeFolderLookupValue(folder?.displayName)));
+
+  if (match?.id) {
+    return {
+      id: match.id,
+      name: match.displayName || canonicalName,
+      source: "display-name",
+    };
+  }
+
+  throw new Error(`Mail folder not found: ${folderName}`);
 }
 
 async function refreshAccessToken(account) {
@@ -242,6 +351,92 @@ async function getInboxMessagesSince(account, sinceDate, options = {}) {
   return allMessages;
 }
 
+async function getInboxMessagesBySender(account, senderAddress, options = {}) {
+  const sender = String(senderAddress || "")
+    .trim()
+    .toLowerCase();
+  if (!sender) {
+    return [];
+  }
+
+  const pageSize = Number(options.pageSize || runtimeConfig.graphPageSize);
+  const maxPages = Number(options.maxPages || runtimeConfig.graphMaxPages);
+  const folderName = String(options.folderName || "inbox").trim();
+  const resolvedFolder = await resolveMailFolder(account, folderName);
+  const folderMessagesPath = `/me/mailFolders/${encodeURIComponent(resolvedFolder.id)}/messages`;
+  const escapedSender = sender.replace(/'/g, "''");
+  const sortMessagesByReceivedDateDesc = (messages) =>
+    messages
+      .slice()
+      .sort((a, b) => new Date(b?.receivedDateTime || 0).getTime() - new Date(a?.receivedDateTime || 0).getTime());
+
+  const query = new URLSearchParams({
+    $select: "id,internetMessageId,from,subject,receivedDateTime,bodyPreview,hasAttachments",
+    $top: String(pageSize),
+    $filter: `from/emailAddress/address eq '${escapedSender}'`,
+  });
+
+  const allMessages = [];
+
+  try {
+    let url = `${folderMessagesPath}?${query.toString()}`;
+    let pageCount = 0;
+
+    while (url && pageCount < maxPages) {
+      const data = await graphRequest(account, url);
+      if (Array.isArray(data.value)) {
+        allMessages.push(...data.value);
+      }
+
+      pageCount += 1;
+      url = data["@odata.nextLink"] ? data["@odata.nextLink"].replace(/^.*\/me/, "") : null;
+    }
+
+    return sortMessagesByReceivedDateDesc(allMessages);
+  } catch (error) {
+    if (!shouldFallbackToClientSideSenderFilter(error)) {
+      throw error;
+    }
+
+    logger.warn("Falling back to client-side sender filter", {
+      accountId: String(account._id),
+      sender,
+      folderName: resolvedFolder.name,
+      folderSource: resolvedFolder.source,
+      reason: error.message,
+    });
+
+    const fallbackQuery = new URLSearchParams({
+      $select: "id,internetMessageId,from,subject,receivedDateTime,bodyPreview,hasAttachments",
+      $orderby: "receivedDateTime desc",
+      $top: String(pageSize),
+    });
+
+    const matched = [];
+    let fallbackUrl = `${folderMessagesPath}?${fallbackQuery.toString()}`;
+    let fallbackPages = 0;
+
+    while (fallbackUrl && fallbackPages < maxPages) {
+      const data = await graphRequest(account, fallbackUrl);
+      if (Array.isArray(data.value)) {
+        for (const message of data.value) {
+          const from = String(message?.from?.emailAddress?.address || "")
+            .trim()
+            .toLowerCase();
+          if (from === sender) {
+            matched.push(message);
+          }
+        }
+      }
+
+      fallbackPages += 1;
+      fallbackUrl = data["@odata.nextLink"] ? data["@odata.nextLink"].replace(/^.*\/me/, "") : null;
+    }
+
+    return sortMessagesByReceivedDateDesc(matched);
+  }
+}
+
 async function getFullMessageBody(account, messageId) {
   const encodedId = encodeURIComponent(messageId);
   const data = await graphRequest(
@@ -323,6 +518,7 @@ module.exports = {
   graphRequest,
   getMailboxProfile,
   getInboxMessagesSince,
+  getInboxMessagesBySender,
   getFullMessageBody,
   markAccountError,
   markAccountHealthy,

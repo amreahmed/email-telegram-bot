@@ -19,6 +19,9 @@ const runtimeConfig = {
   maxConsecutiveFailures: Math.min(Math.max(toInt(process.env.MAX_CONSECUTIVE_FAILURES, 5), 1), 50),
   debugMailChecks: toBool(process.env.DEBUG_MAIL_CHECKS, false),
   graphRequestMaxRetries: Math.min(Math.max(toInt(process.env.GRAPH_REQUEST_MAX_RETRIES, 4), 1), 10),
+  ticketReportPageSize: Math.min(Math.max(toInt(process.env.TICKET_REPORT_PAGE_SIZE, 100), 10), 200),
+  ticketReportMaxPages: Math.min(Math.max(toInt(process.env.TICKET_REPORT_MAX_PAGES, 20), 1), 100),
+  ticketReportAccountConcurrency: Math.min(Math.max(toInt(process.env.TICKET_REPORT_ACCOUNT_CONCURRENCY, 6), 1), 20),
 };
 
 module.exports = {

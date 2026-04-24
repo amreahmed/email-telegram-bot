@@ -2,10 +2,13 @@ require("dotenv").config();
 
 const app = require("./app");
 const { connectDB } = require("./config/db");
-const { initTelegramBot } = require("./services/telegramService");
+const telegramServiceModule = require("./services/telegramService");
 const { registerTelegramCommands } = require("./controllers/telegramController");
 const { startPolling, stopPolling } = require("./services/pollingService");
 const logger = require("./utils/logger").withContext("TelegramBot");
+
+const initTelegramBot =
+  typeof telegramServiceModule === "function" ? telegramServiceModule : telegramServiceModule?.initTelegramBot;
 
 const port = Number(process.env.PORT || 3000);
 
@@ -32,6 +35,11 @@ async function bootstrap() {
   let bot;
   try {
     logger.info("Initializing Telegram bot...");
+    if (typeof initTelegramBot !== "function") {
+      const exportedKeys =
+        telegramServiceModule && typeof telegramServiceModule === "object" ? Object.keys(telegramServiceModule) : [];
+      throw new Error(`Invalid telegramService export shape. Keys: ${exportedKeys.join(",") || "none"}`);
+    }
     bot = initTelegramBot(process.env.BOT_TOKEN);
     logger.info("Bot initialized");
 

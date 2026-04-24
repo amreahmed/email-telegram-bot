@@ -1,17 +1,38 @@
+const fs = require("fs");
+const path = require("path");
 const TelegramUser = require("../models/TelegramUser");
 const OutlookAccount = require("../models/OutlookAccount");
 const { createAuthUrlForTelegramUser } = require("../services/oauthService");
-const { checkForUser, checkForUserWithOptions } = require("../services/pollingService");
+const {
+  checkForUser,
+  checkForUserWithOptions,
+  pausePolling,
+  resumePolling,
+  waitForPollingIdle,
+} = require("../services/pollingService");
+const { generateTicketReports } = require("../services/ticketReportService");
+const {
+  attachAuditToContext,
+  auditIncomingUpdate,
+  safeEditMessageText,
+  safeSendDocument,
+  safeSendMessage,
+} = require("../services/telegramService");
 const { resolveSharedScope } = require("../services/sharedAccessService");
 const logger = require("../utils/logger");
 
 const ACCOUNTS_PAGE_SIZE = 50;
+const TICKET_SELECTION_IDLE_MS = 2500;
+const TICKET_PROGRESS_EDIT_INTERVAL_MS = 1000;
+const pendingTicketsSelection = new Map();
+const runningTicketScans = new Set();
 
 const LABELS = {
   ar: {
     connect: "🔐 ربط Outlook",
     accounts: "📧 الحسابات",
     checkNow: "🔄 فحص الآن",
+    ticketsCheck: "🎟 فحص التذاكر",
     help: "ℹ️ المساعدة",
     language: "🌐 اللغة / Language",
     unlink: "🗑 فك ربط حساب",
@@ -20,6 +41,7 @@ const LABELS = {
     connect: "🔐 Connect Outlook",
     accounts: "📧 My Accounts",
     checkNow: "🔄 Check Now",
+    ticketsCheck: "🎟 Tickets Check",
     help: "ℹ️ Help",
     language: "🌐 اللغة / Language",
     unlink: "🗑 Unlink Account",
@@ -48,6 +70,42 @@ const TEXT = {
     checkDuplicates: "المكررة المتخطاة",
     checkNonMatching: "غير المطابقة",
     checkError: "❌ فشل الفحص. حاول مرة أخرى.",
+    ticketsCheckPrompt:
+      "🎟 أرسل الآن الحسابات التي تريد فحصها (كل حساب في سطر).\n\n" +
+      "الصيغة المقبولة:\n" +
+      "1- email@example.com\n" +
+      "أو فقط\n" +
+      "email@example.com\n\n" +
+      "إذا كانت القائمة طويلة يمكنك إرسالها في أكثر من رسالة، وسيبدأ الفحص تلقائيا بعد توقف الرسائل لثانيتين.\n\n" +
+      "أرسل /cancel للإلغاء.",
+    ticketsCheckCollecting:
+      "📥 تم استلام {{count}} بريد حتى الآن.\n" +
+      "أرسل بقية القائمة في رسائل إضافية إذا كانت طويلة.\n" +
+      "سيبدأ الفحص تلقائيا بعد توقف الرسائل لثانيتين.\n" +
+      "أرسل /cancel للإلغاء.",
+    ticketsCheckNoSelection: "❌ لم أستلم أي بريد صحيح. أرسل بريد واحد على الأقل، كل بريد في سطر.",
+    ticketsCheckNoMatchingAccounts: "❌ لا توجد حسابات نشطة مطابقة في النظام للحسابات التي أرسلتها.",
+    ticketsCheckNoTickets: "ℹ️ لم يتم العثور على أي تذاكر في الحسابات المحددة.",
+    ticketsCheckRunning: "⏳ يوجد فحص تذاكر قيد التنفيذ الآن. انتظر حتى يكتمل ثم أعد المحاولة.",
+    ticketsCheckAllStarted: "⏳ بدأ فحص جميع الحسابات المتصلة عن رسائل التذاكر من noreply@ahlan.sa ...",
+    ticketsCheckProgress:
+      "⏳ جار فحص التذاكر...\n\n" +
+      "التقدم: {{done}}/{{total}}\n" +
+      "الإيميلات المستلمة: {{requested}}",
+    ticketsCheckAllProgress:
+      "⏳ جار فحص جميع الحسابات المتصلة...\n\n" +
+      "التقدم: {{done}}/{{total}}",
+    ticketsCheckAllNoAccounts: "❌ لا توجد حسابات Outlook نشطة متصلة حاليا.",
+    ticketsCheckAllNoTickets: "ℹ️ لم يتم العثور على أي تذاكر في جميع الحسابات المتصلة.",
+    ticketsCheckStarted: "⏳ بدأ فحص الحسابات المحددة عن رسائل التذاكر من noreply@ahlan.sa ...",
+    ticketsCheckDone:
+      "✅ تم إنشاء ملفات التذاكر.\n\n" +
+      "الحسابات المطلوبة: {{requested}}\n" +
+      "الحسابات المفحوصة: {{accounts}}\n" +
+      "إجمالي التذاكر: {{tickets}}\n" +
+      "المجموعات المتجاورة: {{adjacent}}\n" +
+      "التذاكر غير المتجاورة: {{nonAdjacent}}",
+    ticketsCheckError: "❌ حدث خطأ أثناء فحص التذاكر.",
     debugTitle: "🧪 نتائج فحص Debug",
     debugNoEvents: "لا توجد أحداث Debug حالية.",
     unlinkPrompt: "لفك ربط حساب، أرسل الأمر بهذا الشكل:\n" + "/unlink 1\n" + "أو\n" + "/unlink email@example.com",
@@ -72,6 +130,7 @@ const TEXT = {
       "استخدم /start للعودة للقائمة.",
     switchedToArabic: "✅ تم تغيير اللغة إلى العربية.",
     switchedToEnglish: "✅ Language changed to English.",
+    cancelled: "✅ تم الإلغاء.",
     genericError: "❌ حدث خطأ غير متوقع. حاول مرة أخرى.",
   },
   en: {
@@ -95,6 +154,42 @@ const TEXT = {
     checkDuplicates: "Duplicate skips",
     checkNonMatching: "Non-matching skips",
     checkError: "❌ Failed to check inbox. Please try again.",
+    ticketsCheckPrompt:
+      "🎟 Send the account emails you want to scan (one per line).\n\n" +
+      "Accepted format:\n" +
+      "1- email@example.com\n" +
+      "or just\n" +
+      "email@example.com\n\n" +
+      "If the list is long, you can send it across multiple messages. The scan starts automatically after 2 seconds of no new messages.\n\n" +
+      "Send /cancel to abort.",
+    ticketsCheckCollecting:
+      "📥 Received {{count}} emails so far.\n" +
+      "Send the rest in additional messages if the list is long.\n" +
+      "The scan will start automatically after 2 seconds with no new messages.\n" +
+      "Send /cancel to abort.",
+    ticketsCheckNoSelection: "❌ No valid emails found. Send at least one email, each on a separate line.",
+    ticketsCheckNoMatchingAccounts: "❌ No active connected accounts matched your list.",
+    ticketsCheckNoTickets: "ℹ️ No tickets were found in the selected accounts.",
+    ticketsCheckRunning: "⏳ A ticket scan is already running. Please wait until it completes and try again.",
+    ticketsCheckAllStarted: "⏳ Started scanning all connected accounts for ticket emails from noreply@ahlan.sa ...",
+    ticketsCheckProgress:
+      "⏳ Scanning tickets...\n\n" +
+      "Progress: {{done}}/{{total}}\n" +
+      "Emails received: {{requested}}",
+    ticketsCheckAllProgress:
+      "⏳ Scanning all connected accounts...\n\n" +
+      "Progress: {{done}}/{{total}}",
+    ticketsCheckAllNoAccounts: "❌ No active Outlook accounts are currently connected.",
+    ticketsCheckAllNoTickets: "ℹ️ No tickets were found across all connected accounts.",
+    ticketsCheckStarted: "⏳ Started scanning selected accounts for ticket emails from noreply@ahlan.sa ...",
+    ticketsCheckDone:
+      "✅ Ticket reports generated.\n\n" +
+      "Requested accounts: {{requested}}\n" +
+      "Accounts scanned: {{accounts}}\n" +
+      "Total tickets: {{tickets}}\n" +
+      "Adjacent groups: {{adjacent}}\n" +
+      "Non-adjacent tickets: {{nonAdjacent}}",
+    ticketsCheckError: "❌ Ticket scan failed.",
     debugTitle: "🧪 Debug Check Results",
     debugNoEvents: "No debug events available.",
     unlinkPrompt: "To unlink an account, send:\n" + "/unlink 1\n" + "or\n" + "/unlink email@example.com",
@@ -119,6 +214,7 @@ const TEXT = {
       "Use /start to return to menu.",
     switchedToArabic: "✅ تم تغيير اللغة إلى العربية.",
     switchedToEnglish: "✅ Language changed to English.",
+    cancelled: "✅ Cancelled.",
     genericError: "❌ Unexpected error. Please try again.",
   },
 };
@@ -166,7 +262,8 @@ async function showMainMenu(ctx, user) {
   const labels = labelsFor(user);
   const keyboard = [
     [labels.connect, labels.accounts],
-    [labels.checkNow, labels.help],
+    [labels.checkNow, labels.ticketsCheck],
+    [labels.help],
     [labels.unlink, labels.language],
   ];
 
@@ -314,6 +411,351 @@ async function handleCheck(ctx) {
   }
 }
 
+function applyTemplate(template, values) {
+  let output = String(template || "");
+  for (const [key, value] of Object.entries(values || {})) {
+    output = output.replaceAll(`{{${key}}}`, String(value));
+  }
+  return output;
+}
+
+function formatShortErrorMessage(error) {
+  const raw = String(error?.message || "unknown error")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!raw) {
+    return "unknown error";
+  }
+  return raw.length > 350 ? `${raw.slice(0, 350)}...` : raw;
+}
+
+function parseAccountSelectionText(rawText) {
+  const lines = String(rawText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const emailRegex = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+  const emails = [];
+
+  for (const line of lines) {
+    const cleaned = line.replace(/^\d+\s*[-.)]\s*/, "").trim();
+    const match = cleaned.match(emailRegex);
+    if (!match) {
+      continue;
+    }
+    emails.push(match[0].toLowerCase());
+  }
+
+  return [...new Set(emails)];
+}
+
+function getPendingTicketSelectionState(telegramId) {
+  return pendingTicketsSelection.get(String(telegramId || "")) || null;
+}
+
+function clearPendingTicketSelection(telegramId) {
+  const key = String(telegramId || "");
+  const state = getPendingTicketSelectionState(key);
+  if (state?.timer) {
+    clearTimeout(state.timer);
+  }
+  pendingTicketsSelection.delete(key);
+  return state;
+}
+
+function buildTicketSelectionCollectingMessage(user, count) {
+  return applyTemplate(textFor(user, "ticketsCheckCollecting"), { count });
+}
+
+function buildTicketScanProgressMessage(user, processed, total, requestedCount, scanAll = false) {
+  if (scanAll) {
+    return applyTemplate(textFor(user, "ticketsCheckAllProgress"), {
+      done: processed,
+      total,
+    });
+  }
+
+  return applyTemplate(textFor(user, "ticketsCheckProgress"), {
+    done: processed,
+    total,
+    requested: requestedCount,
+  });
+}
+
+async function updateTicketStatusMessage(chatId, messageId, message) {
+  if (!chatId || !messageId) {
+    return;
+  }
+
+  await safeEditMessageText(chatId, messageId, message);
+}
+
+async function cleanupReportDirectory(files) {
+  const reportDirectory = files?.[0] ? path.dirname(files[0]) : null;
+  if (!reportDirectory) {
+    return;
+  }
+
+  await fs.promises.rm(reportDirectory, { recursive: true, force: true }).catch((cleanupError) => {
+    logger.warn("Failed to cleanup ticket report temp directory", { error: cleanupError.message });
+  });
+}
+
+async function sendTicketScanResult({ chatId, progressMessageId, user, result, noAccountsText, noTicketsText }) {
+  if (!chatId) {
+    return;
+  }
+
+  if (result.accountsScanned === 0) {
+    await updateTicketStatusMessage(chatId, progressMessageId, noAccountsText);
+    return;
+  }
+
+  if (result.totalTickets === 0) {
+    await updateTicketStatusMessage(chatId, progressMessageId, noTicketsText);
+    return;
+  }
+
+  await safeSendDocument(chatId, result.files[0], { caption: "01 - All tickets" });
+  await safeSendDocument(chatId, result.files[1], { caption: "02 - Adjacent seats" });
+  await safeSendDocument(chatId, result.files[2], { caption: "03 - Non-adjacent tickets" });
+
+  await cleanupReportDirectory(result.files);
+
+  const doneMessage = applyTemplate(textFor(user, "ticketsCheckDone"), {
+    requested: result.requestedCount,
+    accounts: result.accountsScanned,
+    tickets: result.totalTickets,
+    adjacent: result.adjacentGroups,
+    nonAdjacent: result.nonAdjacentTickets,
+  });
+  await updateTicketStatusMessage(chatId, progressMessageId, doneMessage);
+}
+
+function startTicketScanJob({
+  telegramId,
+  chatId,
+  progressMessageId,
+  user,
+  accountEmails,
+  noAccountsText,
+  noTicketsText,
+  logContext,
+  scanAll = false,
+}) {
+  let lastProgressUpdateAt = 0;
+  let lastProgressText = "";
+
+  const progressHandler = async ({ processedAccounts, totalAccounts, requestedCount }) => {
+    if (!chatId || !progressMessageId) {
+      return;
+    }
+
+    const now = Date.now();
+    const effectiveTotal = Number(totalAccounts || requestedCount || 0);
+    const progressText = buildTicketScanProgressMessage(
+      user,
+      Number(processedAccounts || 0),
+      effectiveTotal,
+      Number(requestedCount || 0),
+      scanAll,
+    );
+
+    const shouldThrottle =
+      now - lastProgressUpdateAt < TICKET_PROGRESS_EDIT_INTERVAL_MS &&
+      Number(processedAccounts || 0) < effectiveTotal;
+
+    if (progressText === lastProgressText || shouldThrottle) {
+      return;
+    }
+
+    lastProgressText = progressText;
+    lastProgressUpdateAt = now;
+    await updateTicketStatusMessage(chatId, progressMessageId, progressText);
+  };
+
+  void (async () => {
+    let pollingPaused = false;
+
+    try {
+      pausePolling("ticket-scan");
+      pollingPaused = true;
+      await waitForPollingIdle();
+
+      const result = await generateTicketReports({ accountEmails, onProgress: progressHandler });
+      await sendTicketScanResult({
+        chatId,
+        progressMessageId,
+        user,
+        result,
+        noAccountsText,
+        noTicketsText,
+      });
+    } catch (error) {
+      logger.error(logContext, {
+        error: error.message,
+        stack: error.stack,
+        telegramId,
+        selectedEmails: accountEmails,
+      });
+      await updateTicketStatusMessage(
+        chatId,
+        progressMessageId,
+        `${textFor(user, "ticketsCheckError")}\n${formatShortErrorMessage(error)}`,
+      );
+    } finally {
+      if (pollingPaused) {
+        resumePolling("ticket-scan");
+      }
+      runningTicketScans.delete(telegramId);
+    }
+  })();
+}
+
+async function finalizePendingTicketsSelection(telegramId) {
+  const state = clearPendingTicketSelection(telegramId);
+  if (!state) {
+    return;
+  }
+
+  const user = state.user;
+  const selectedEmails = Array.from(state.selectedEmails || []);
+
+  if (!user || !state.chatId) {
+    return;
+  }
+
+  if (selectedEmails.length === 0) {
+    await updateTicketStatusMessage(state.chatId, state.statusMessageId, textFor(user, "ticketsCheckNoSelection"));
+    return;
+  }
+
+  if (runningTicketScans.has(telegramId)) {
+    await updateTicketStatusMessage(state.chatId, state.statusMessageId, textFor(user, "ticketsCheckRunning"));
+    return;
+  }
+
+  runningTicketScans.add(telegramId);
+  const progressMessage = await safeSendMessage(
+    state.chatId,
+    buildTicketScanProgressMessage(user, 0, selectedEmails.length, selectedEmails.length, false),
+  );
+  const progressMessageId = progressMessage?.message_id || state.statusMessageId;
+
+  startTicketScanJob({
+    telegramId,
+    chatId: state.chatId,
+    progressMessageId,
+    user,
+    accountEmails: selectedEmails,
+    noAccountsText: textFor(user, "ticketsCheckNoMatchingAccounts"),
+    noTicketsText: textFor(user, "ticketsCheckNoTickets"),
+    logContext: "Error in pending tickets selection handler",
+  });
+}
+
+function schedulePendingTicketsSelectionFinalize(telegramId) {
+  const state = getPendingTicketSelectionState(telegramId);
+  if (!state) {
+    return;
+  }
+
+  if (state.timer) {
+    clearTimeout(state.timer);
+  }
+
+  state.timer = setTimeout(() => {
+    void finalizePendingTicketsSelection(telegramId);
+  }, TICKET_SELECTION_IDLE_MS);
+}
+
+async function handlePendingTicketsSelection(ctx) {
+  const telegramId = String(ctx.from?.id || "");
+  const state = getPendingTicketSelectionState(telegramId);
+  if (!telegramId || !state) {
+    return;
+  }
+
+  const user = await getOrCreateTelegramUser(ctx);
+  const text = String(ctx.message?.text || "").trim();
+
+  if (!text) {
+    return;
+  }
+
+  if (/^\/cancel$/i.test(text)) {
+    const currentState = clearPendingTicketSelection(telegramId);
+    await updateTicketStatusMessage(ctx.chat?.id, currentState?.statusMessageId, textFor(user, "cancelled"));
+    return;
+  }
+
+  if (/^\//.test(text)) {
+    return;
+  }
+
+  if (runningTicketScans.has(telegramId)) {
+    clearPendingTicketSelection(telegramId);
+    await updateTicketStatusMessage(ctx.chat?.id, state.statusMessageId, textFor(user, "ticketsCheckRunning"));
+    return;
+  }
+
+  const selectedEmails = parseAccountSelectionText(text);
+  for (const email of selectedEmails) {
+    state.selectedEmails.add(email);
+  }
+
+  state.user = user;
+  state.chatId = ctx.chat?.id;
+  schedulePendingTicketsSelectionFinalize(telegramId);
+}
+
+async function handleTicketsCheck(ctx) {
+  const user = await getOrCreateTelegramUser(ctx);
+  const telegramId = String(user.telegramId || "");
+
+  if (runningTicketScans.has(telegramId)) {
+    await ctx.reply(textFor(user, "ticketsCheckRunning"));
+    return;
+  }
+
+  clearPendingTicketSelection(telegramId);
+  const statusMessage = await ctx.reply(textFor(user, "ticketsCheckPrompt"));
+  pendingTicketsSelection.set(telegramId, {
+    createdAt: Date.now(),
+    chatId: ctx.chat?.id,
+    statusMessageId: statusMessage?.message_id,
+    selectedEmails: new Set(),
+    timer: null,
+    user,
+  });
+}
+
+async function handleTicketsCheckAll(ctx) {
+  const user = await getOrCreateTelegramUser(ctx);
+  const telegramId = String(user.telegramId || "");
+
+  if (runningTicketScans.has(telegramId)) {
+    await ctx.reply(textFor(user, "ticketsCheckRunning"));
+    return;
+  }
+
+  runningTicketScans.add(telegramId);
+  const statusMessage = await ctx.reply(buildTicketScanProgressMessage(user, 0, 0, 0, true));
+
+  startTicketScanJob({
+    telegramId,
+    chatId: ctx.chat?.id,
+    progressMessageId: statusMessage?.message_id,
+    user,
+    accountEmails: undefined,
+    noAccountsText: textFor(user, "ticketsCheckAllNoAccounts"),
+    noTicketsText: textFor(user, "ticketsCheckAllNoTickets"),
+    logContext: "Error in tickets check all handler",
+    scanAll: true,
+  });
+}
+
 async function handleCheckDebug(ctx) {
   const user = await getOrCreateTelegramUser(ctx);
 
@@ -455,11 +897,27 @@ function registerTelegramCommands(bot) {
     }
   });
 
+  bot.use(async (ctx, next) => {
+    attachAuditToContext(ctx);
+
+    try {
+      await auditIncomingUpdate(ctx);
+    } catch (error) {
+      logger.error("Failed to audit Telegram update", {
+        error: error.message,
+        updateType: ctx?.updateType,
+      });
+    }
+
+    return next();
+  });
+
   bot.start(safeExecute(handleStart));
 
   bot.hears([LABELS.ar.connect, LABELS.en.connect], safeExecute(handleConnect));
   bot.hears([LABELS.ar.accounts, LABELS.en.accounts], safeExecute(handleAccounts));
   bot.hears([LABELS.ar.checkNow, LABELS.en.checkNow], safeExecute(handleCheck));
+  bot.hears([LABELS.ar.ticketsCheck, LABELS.en.ticketsCheck], safeExecute(handleTicketsCheck));
   bot.hears([LABELS.ar.help, LABELS.en.help], safeExecute(handleHelp));
   bot.hears([LABELS.ar.language, LABELS.en.language], safeExecute(handleLanguageToggle));
   bot.hears([LABELS.ar.unlink, LABELS.en.unlink], safeExecute(handleUnlinkHelp));
@@ -468,10 +926,21 @@ function registerTelegramCommands(bot) {
   bot.command("connect", safeExecute(handleConnect));
   bot.command("accounts", safeExecute(handleAccounts));
   bot.command("check", safeExecute(handleCheck));
+  bot.command("ticketscheck", safeExecute(handleTicketsCheck));
+  bot.command("ticketscheckall", safeExecute(handleTicketsCheckAll));
   bot.command("checkdebug", safeExecute(handleCheckDebug));
   bot.command("help", safeExecute(handleHelp));
   bot.command("lang", safeExecute(handleLanguageToggle));
+  bot.command(
+    "cancel",
+    safeExecute(async (ctx) => {
+      const user = await getOrCreateTelegramUser(ctx);
+      clearPendingTicketSelection(user.telegramId);
+      await ctx.reply(textFor(user, "cancelled"));
+    }),
+  );
   bot.command("unlink", safeExecute(handleUnlink));
+  bot.on("text", safeExecute(handlePendingTicketsSelection));
   bot.action(/^accounts:page:(\d+)$/, safeExecute(handleAccountsPageAction));
 
   return bot;

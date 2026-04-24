@@ -14,6 +14,56 @@ const logger = require("../utils/logger").withContext("PollingService");
 const { runtimeConfig } = require("../config/runtime");
 
 let pollingTask = null;
+let pollingCycleRunning = false;
+let pollingPauseCount = 0;
+const pollingIdleWaiters = new Set();
+
+function flushPollingIdleWaiters() {
+  for (const resolve of pollingIdleWaiters) {
+    try {
+      resolve();
+    } catch (error) {
+      logger.warn("Polling idle waiter failed", { error: error.message });
+    }
+  }
+  pollingIdleWaiters.clear();
+}
+
+function isPollingPaused() {
+  return pollingPauseCount > 0;
+}
+
+function isPollingRunning() {
+  return pollingCycleRunning;
+}
+
+function pausePolling(reason = "manual") {
+  pollingPauseCount += 1;
+  logger.info("Polling paused", {
+    reason,
+    pauseCount: pollingPauseCount,
+    cycleRunning: pollingCycleRunning,
+  });
+}
+
+function resumePolling(reason = "manual") {
+  pollingPauseCount = Math.max(0, pollingPauseCount - 1);
+  logger.info("Polling resumed", {
+    reason,
+    pauseCount: pollingPauseCount,
+    cycleRunning: pollingCycleRunning,
+  });
+}
+
+function waitForPollingIdle() {
+  if (!pollingCycleRunning) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    pollingIdleWaiters.add(resolve);
+  });
+}
 
 function toProviderOverrides(notificationRules) {
   return notificationRules
@@ -320,6 +370,35 @@ async function checkAllAccounts() {
   });
 }
 
+async function runPollingCycle(trigger = "cron") {
+  if (isPollingPaused()) {
+    logger.info("Polling cycle skipped because polling is paused", {
+      trigger,
+      pauseCount: pollingPauseCount,
+    });
+    return false;
+  }
+
+  if (pollingCycleRunning) {
+    logger.info("Polling cycle skipped because previous cycle is still running", { trigger });
+    return false;
+  }
+
+  pollingCycleRunning = true;
+
+  try {
+    await checkAllAccounts();
+    logger.info("Polling cycle completed", { trigger });
+    return true;
+  } catch (error) {
+    logger.error("Polling cycle failed", { trigger, error: error.message });
+    return false;
+  } finally {
+    pollingCycleRunning = false;
+    flushPollingIdleWaiters();
+  }
+}
+
 function startPolling() {
   if (pollingTask) {
     pollingTask.stop();
@@ -330,13 +409,8 @@ function startPolling() {
   const safeSeconds = Number.isNaN(intervalSeconds) ? 45 : Math.min(Math.max(intervalSeconds, 30), 60);
   const expression = `*/${safeSeconds} * * * * *`;
 
-  pollingTask = cron.schedule(expression, async () => {
-    try {
-      await checkAllAccounts();
-      logger.info("Polling cycle completed");
-    } catch (error) {
-      logger.error("Polling cycle failed", { error: error.message });
-    }
+  pollingTask = cron.schedule(expression, () => {
+    void runPollingCycle("cron");
   });
 
   logger.info("Polling started", { expression });
@@ -352,7 +426,12 @@ function stopPolling() {
 module.exports = {
   checkForUser,
   checkForUserWithOptions,
+  isPollingPaused,
+  isPollingRunning,
+  pausePolling,
   processAccount,
+  resumePolling,
   startPolling,
   stopPolling,
+  waitForPollingIdle,
 };
