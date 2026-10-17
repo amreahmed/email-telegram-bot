@@ -72,16 +72,26 @@ async function bootstrap() {
       logger.info(`Express server listening on port ${port}`);
     });
 
+    server.setTimeout(30000);
+
     const shutdown = async (signal) => {
-      logger.warn(`Received ${signal}, shutting down`);
+      logger.warn(`Received ${signal}, shutting down...`);
       stopPolling();
+
+      const forceExitTimer = setTimeout(() => {
+        logger.error("Forced shutdown after timeout (10s)");
+        process.exit(1);
+      }, 10000);
+      forceExitTimer.unref();
+
       try {
         await bot.stop(signal);
       } catch (stopError) {
         logger.error("Error stopping bot", { error: stopError.message });
       }
+
       server.close(() => {
-        logger.info("Server closed");
+        logger.info("Server closed successfully");
         process.exit(0);
       });
     };

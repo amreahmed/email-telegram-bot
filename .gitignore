@@ -1,6 +1,36 @@
-node_modules
+# Dependencies
+node_modules/
+jspm_packages/
+
+# Environment Variables & Secrets
 .env
+.env.production
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+
+# Runtime / Reports / Temp Files
+*.xlsx
+*.tmp
+*.temp
+temp/
+coverage/
+
+# OS & Editor Artifacts
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Backup & Scratch files
+*.bak
+*.backup

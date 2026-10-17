@@ -348,6 +348,80 @@ function buildAccountsNav(user, page, totalPages) {
   return { inline_keyboard: [navRow] };
 }
 
+function buildUnlinkPageText(user, accounts, page, totalPages) {
+  const start = (page - 1) * ACCOUNTS_PAGE_SIZE;
+  const slice = accounts.slice(start, start + ACCOUNTS_PAGE_SIZE);
+
+  const lines = slice.map((account, index) => {
+    const globalIndex = start + index + 1;
+    return `${globalIndex}. ${account.email}`;
+  });
+
+  return textFor(user, "accountsTitle") + lines.join("\n") + `\n\n${textFor(user, "accountsPageInfo")} ${page}/${totalPages}`;
+}
+
+function buildUnlinkNav(user, page, totalPages) {
+  const navRow = [];
+  if (page > 1) {
+    navRow.push({ text: textFor(user, "navPrev"), callback_data: `unlink:page:${page - 1}` });
+  }
+  if (page < totalPages) {
+    navRow.push({ text: textFor(user, "navNext"), callback_data: `unlink:page:${page + 1}` });
+  }
+
+  if (navRow.length === 0) {
+    return undefined;
+  }
+
+  return { inline_keyboard: [navRow] };
+}
+
+async function renderUnlinkPage(ctx, user, accounts, pageNumber, editMessage) {
+  const totalPages = Math.max(1, Math.ceil(accounts.length / ACCOUNTS_PAGE_SIZE));
+  const page = Math.min(Math.max(Number(pageNumber) || 1, 1), totalPages);
+
+  const text = buildUnlinkPageText(user, accounts, page, totalPages);
+  const replyMarkup = buildUnlinkNav(user, page, totalPages);
+  const options = replyMarkup ? { reply_markup: replyMarkup } : undefined;
+
+  if (editMessage) {
+    try {
+      if (options) {
+        return await ctx.editMessageText(text, options);
+      }
+      return await ctx.editMessageText(text);
+    } catch (error) {
+      logger.warn("Failed to edit unlink page message, sending new message", { error: error.message });
+      if (options) {
+        return ctx.reply(text, options);
+      }
+      return ctx.reply(text);
+    }
+  }
+
+  if (options) {
+    return ctx.reply(text, options);
+  }
+  return ctx.reply(text);
+}
+
+async function handleUnlinkPageAction(ctx) {
+  const user = await getOrCreateTelegramUser(ctx);
+  const scope = await resolveSharedScope(user.telegramId, user._id);
+  const accounts = await OutlookAccount.find({ telegramUserId: { $in: scope.userIds }, isActive: true }).sort({
+    connectedAt: -1,
+  });
+  const requestedPage = Number(ctx.match?.[1] || 1);
+
+  await ctx.answerCbQuery();
+
+  if (accounts.length === 0) {
+    return ctx.reply(textFor(user, "unlinkNoAccounts"));
+  }
+
+  return renderUnlinkPage(ctx, user, accounts, requestedPage, true);
+}
+
 async function renderAccountsPage(ctx, user, accounts, pageNumber, editMessage) {
   const totalPages = Math.max(1, Math.ceil(accounts.length / ACCOUNTS_PAGE_SIZE));
   const page = Math.min(Math.max(Number(pageNumber) || 1, 1), totalPages);
@@ -806,8 +880,9 @@ async function handleUnlinkHelp(ctx) {
     return ctx.reply(textFor(user, "unlinkNoAccounts"));
   }
 
-  const lines = accounts.map((account, index) => `${index + 1}. ${account.email}`);
-  return ctx.reply(`${textFor(user, "accountsTitle")}${lines.join("\n")}\n\n${textFor(user, "unlinkPrompt")}`);
+  // Render first page of unlinkable accounts with pagination to avoid oversized messages
+  await renderUnlinkPage(ctx, user, accounts, 1, false);
+  return ctx.reply(textFor(user, "unlinkPrompt"));
 }
 
 async function handleUnlink(ctx) {
@@ -942,6 +1017,7 @@ function registerTelegramCommands(bot) {
   bot.command("unlink", safeExecute(handleUnlink));
   bot.on("text", safeExecute(handlePendingTicketsSelection));
   bot.action(/^accounts:page:(\d+)$/, safeExecute(handleAccountsPageAction));
+    bot.action(/^unlink:page:(\d+)$/, safeExecute(handleUnlinkPageAction));
 
   return bot;
 }
